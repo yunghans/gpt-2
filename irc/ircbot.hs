@@ -276,6 +276,7 @@ main = do
         | T.isPrefixOf "@complete " msg
         = completion (getChannel src) (getUser src) (cleanzwsp $ T.drop (T.length "@complete ") msg)
       handleMessage (Channel ch u) (_, Right msg)
+        | u == "Robomot" = pure()
         | ch == kChannel
         = do now <- liftIO getCurrentTime
              let timestamp = formatTimestamp now
