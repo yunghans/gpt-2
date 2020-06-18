@@ -18,7 +18,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import qualified Network.Wreq as Wreq
-import           System.Timeout
+import           System.Timeout (timeout)
 
 timeoutRetry :: IO a -> IO a
 timeoutRetry m = do ma <- timeout (15 * 1000000) m

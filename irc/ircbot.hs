@@ -9,6 +9,8 @@ module Main where
 import           Control.Applicative
 import           Control.Concurrent
 import           Control.Concurrent.MVar
+import           Control.Concurrent.STM.TVar
+import           Control.Concurrent.STM
 import           Control.Exception (SomeException)
 import           Control.Lens
 import           Control.Monad
@@ -165,7 +167,7 @@ sendLine chan msg
       sendLine chan ("…" <> T.takeEnd overage msg)
   | otherwise = send (Privmsg chan (Right msg))
   where
-    lengthLimit = 510 - 50
+    lengthLimit = 510 - 58
     totalLength = T.length ("PRIVMSG " <> chan <> " :" <> msg)
     overage = totalLength - lengthLimit + 3
 
@@ -176,6 +178,18 @@ gwernpaste chan prompt = void $ fork (go
   where
     go = do
       orig_ctx <- pure "" -- use stContext
+      ls <- liftIO (sampleGwernpaste orig_ctx prompt)
+      for_ ls $ \line -> do
+        sendMsg chan line
+        extendContext line
+
+gwernpaste' :: Channel -> Text -> IRC MyState ()
+gwernpaste' chan prompt = void $ fork (go
+                                      `catch` (\(e :: GPT2.Timeout) -> sendLine kChannel "Timed out")
+                                      `catch` (\(e :: SomeException) -> liftIO (print e)))
+  where
+    go = do
+      orig_ctx <- use stContext
       ls <- liftIO (sampleGwernpaste orig_ctx prompt)
       for_ ls $ \line -> do
         sendMsg chan line
@@ -208,11 +222,29 @@ getUser (User u) = u
 
 tshow x = T.pack (show x)
 
+pingThread :: TVar (Maybe Text) -> IRC MyState ()
+pingThread pingServer = go
+  where
+    go = do
+      liftIO (threadDelay (60 * 1000000))
+      pingOnce `catch` (\(e :: SomeException) -> liftIO (print e))
+      go
+
+    pingOnce = do
+      server <- liftIO (atomically $ do
+                           may_server <- readTVar pingServer
+                           case may_server of
+                             Just s -> return s
+                             Nothing -> retry)
+      send (Ping server Nothing)
+
 main :: IO ()
 main = do
   hSetBuffering stdout NoBuffering
 
   [nick, pass] <- T.splitOn "/" <$> T.readFile "identity.txt"
+
+  pingServer <- newTVarIO Nothing
 
   let conn = tlsConnection (WithDefaultConfig "chat.freenode.net" 7000)
              & username .~ nick
@@ -226,13 +258,23 @@ main = do
 
       myhandlers = [
         EventHandler (matchType _Notice) handleNotice,
-        EventHandler (matchType _Privmsg) handleMessage
+        EventHandler (matchType _Privmsg) handleMessage,
+        EventHandler (matchType _Ping) handlePing
         ]
 
       handleNotice (User "NickServ") (_, Right msg)
-        | T.isPrefixOf "You are now identified" msg = send (Join kChannel)
-          >> void (fork shutupThread >> fork sampleThread)
+        | T.isPrefixOf "You are now identified" msg = do
+            send (Join kChannel)
+            liftIO (print msg)
+            fork shutupThread
+            fork sampleThread
+            fork (pingThread pingServer)
+            return ()
       handleNotice _ _ = pure()
+
+      handlePing source (sname, ex) = liftIO $ do
+        print (source, sname, ex)
+        atomically (writeTVar pingServer (Just sname))
 
       handleMessage :: Source Text
                          -> (Text, Either CTCPByteString Text)
@@ -247,34 +289,39 @@ main = do
       handleMessage _ (_, Right "gpt2: wake up") = do
         now <- liftIO getCurrentTime
         stLastWakeup .= Just now
-      handleMessage src (_, Right "@gwernpaste") = gwernpaste (getChannel src) ""
-      handleMessage src (_, Right "@clear") = do
-        stContext .= "\n"
-        sendLine (getChannel src) "Forgotten."
-      handleMessage src (_, Right "@info") = do
-        (model, ckpt) <- liftIO getInfo
-        sendLine (getChannel src) ("GPT-2: model=" <> model <> " checkpoint=" <> ckpt)
-      handleMessage src (_, Right "@period") = do
-        period <- use stPeriod
-        sendLine (getChannel src) ("Speaking every " <> tshow period <> " seconds")
+
       handleMessage src (_, Right msg)
-        | "@period " `T.isPrefixOf` msg = do
-            let p = T.drop (T.length "@period ") msg
-            if T.all isDigit p then do
-              let period = max 5 (read (T.unpack p)) :: Int
-              stPeriod .= period
-              sendLine (getChannel src) ("Speaking every " <> tshow period <> " seconds")
-              else do
-              sendLine (getChannel src) ("Expected an integer (minimum 5)")
+        | T.isPrefixOf "@" msg = case cmd of
+            "@clear" -> do
+              stContext .= "\n"
+              sendLine (getChannel src) "Forgotten."
+            "@info" -> do
+              (model, ckpt) <- liftIO getInfo
+              sendLine (getChannel src) ("GPT-2: model=" <> model <> " checkpoint=" <> ckpt)
+            "@period" ->
+              case args of
+                [] -> do
+                  period <- use stPeriod
+                  sendLine (getChannel src) ("Speaking every " <> tshow period <> " seconds")
+                [ptxt] | T.all isDigit ptxt -> do
+                           let period = max 5 (read (T.unpack ptxt)) :: Int
+                           stPeriod .= period
+                           sendLine (getChannel src) ("Speaking every " <> tshow period <> " seconds")
+                _ -> sendLine (getChannel src) ("Expected an integer (minimum 5)")
+            "@gwernpaste" ->
+              case args of
+                ("+ctx" : pwords) ->
+                  gwernpaste' (getChannel src) (T.unwords pwords)
+                pwords ->
+                  gwernpaste (getChannel src) (T.unwords pwords)
+            "@complete" ->
+              completion (getChannel src) (getUser src) (cleanzwsp $ T.unwords args)
+            _ -> pure()
+        where
+          (cmd:args) = T.words msg
       -- handleMessage _ (_, Right "@reload") = do
       --   disconnect
       --   liftIO exitSuccess
-      handleMessage src (_, Right msg)
-        | T.isPrefixOf "@gwernpaste " msg
-        = gwernpaste (getChannel src) (T.drop (T.length "@gwernpaste ") msg)
-      handleMessage src (_, Right msg)
-        | T.isPrefixOf "@complete " msg
-        = completion (getChannel src) (getUser src) (cleanzwsp $ T.drop (T.length "@complete ") msg)
       handleMessage (Channel ch u) (_, Right msg)
         | u == "Robomot" = pure()
         | ch == kChannel
